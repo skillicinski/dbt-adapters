@@ -24,6 +24,27 @@ spark_session_list: Dict[UUID, str] = {}
 spark_session_load: Dict[UUID, int] = {}
 
 
+def _session_id_to_uuid(session_id: str) -> UUID:
+    """
+    Convert session ID to UUID format, handling both legacy UUID and Spark 3.5 formats.
+    Spark 3.5 uses session IDs like 's-00g3abla85cf8u01' instead of standard UUIDs.
+
+    Args:
+        session_id: Session ID from AWS Athena (UUID or s-xxx format)
+
+    Returns:
+        UUID object for session tracking
+    """
+    try:
+        # Try parsing as standard UUID (legacy PySpark 3 format)
+        return UUID(session_id)
+    except ValueError:
+        # Spark 3.5 format (s-xxx): create deterministic UUID from hash
+        # This ensures the same session ID always maps to the same UUID
+        session_hash = md5(session_id.encode()).hexdigest()
+        return UUID(session_hash)
+
+
 def get_boto3_session(connection: Connection) -> boto3.session.Session:
     return boto3.session.Session(
         aws_access_key_id=connection.credentials.aws_access_key_id,
@@ -187,21 +208,28 @@ class AthenaSparkSessionManager:
 
         """
         description = self.session_description
+        engine_config = self.engine_config.copy()
+        is_serverless = "MaxConcurrentDpus" not in engine_config
+
+        if is_serverless:
+            engine_config = {"MaxConcurrentDpus": 2}
+
         response = self.athena_client.start_session(
             Description=description,
             WorkGroup=self.credentials.spark_work_group,
-            EngineConfiguration=self.engine_config,
+            EngineConfiguration=engine_config,
             SessionIdleTimeoutInMinutes=SESSION_IDLE_TIMEOUT_MIN,
         )
         session_id = response["SessionId"]
         if response["State"] != "IDLE":
             self.poll_until_session_creation(session_id)
 
+        session_uuid = _session_id_to_uuid(session_id)
         with self.lock:
-            spark_session_list[UUID(session_id)] = self.session_description
-            spark_session_load[UUID(session_id)] = 1
+            spark_session_list[session_uuid] = self.session_description
+            spark_session_load[session_uuid] = 1
 
-        return UUID(session_id)
+        return session_uuid
 
     def poll_until_session_creation(self, session_id: str) -> None:
         """
@@ -255,9 +283,10 @@ class AthenaSparkSessionManager:
 
         Returns: None
         """
+        session_uuid = _session_id_to_uuid(session_id)
         with self.lock:
-            spark_session_list.pop(UUID(session_id), "Session id not found")
-            spark_session_load.pop(UUID(session_id), "Session id not found")
+            spark_session_list.pop(session_uuid, "Session id not found")
+            spark_session_load.pop(session_uuid, "Session id not found")
 
     def set_spark_session_load(self, session_id: str, change: int) -> None:
         """
@@ -265,7 +294,6 @@ class AthenaSparkSessionManager:
 
         Returns: None
         """
+        session_uuid = _session_id_to_uuid(session_id)
         with self.lock:
-            spark_session_load[UUID(session_id)] = (
-                spark_session_load.get(UUID(session_id), 0) + change
-            )
+            spark_session_load[session_uuid] = spark_session_load.get(session_uuid, 0) + change

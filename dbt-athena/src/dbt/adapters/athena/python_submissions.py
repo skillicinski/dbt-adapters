@@ -5,11 +5,16 @@ from typing import Any, Dict
 import botocore
 from dbt_common.exceptions import DbtRuntimeError
 
-from dbt.adapters.athena.config import AthenaSparkSessionConfig
+from dbt.adapters.athena.config import AthenaSparkSessionConfig, get_boto3_config
 from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.constants import LOGGER
-from dbt.adapters.athena.session import AthenaSparkSessionManager
+from dbt.adapters.athena.session import (
+    AthenaSparkSessionManager,
+    get_boto3_session_from_credentials,
+)
+from dbt.adapters.athena.utils import get_spark_engine_version
 from dbt.adapters.base import PythonJobHelper
+
 
 SUBMISSION_LANGUAGE = "python"
 
@@ -31,8 +36,36 @@ class AthenaPythonJobHelper(PythonJobHelper):
             credentials (AthenaCredentials): Credentials for Athena connection.
         """
         self.relation_name = parsed_model.get("relation_name", None)
+
+        spark_version = None
+        if credentials.spark_work_group:
+            try:
+
+                boto3_session = get_boto3_session_from_credentials(credentials)
+                athena_client = boto3_session.client(
+                    "athena", config=get_boto3_config(num_retries=credentials.num_retries)
+                )
+                work_group_response = athena_client.get_work_group(
+                    WorkGroup=credentials.spark_work_group
+                )
+                spark_version = get_spark_engine_version(work_group_response)
+
+                if spark_version:
+                    LOGGER.debug(
+                        f"Detected Spark version for workgroup '{credentials.spark_work_group}': {spark_version}"
+                    )
+                else:
+                    LOGGER.debug(
+                        f"No Spark version detected for workgroup '{credentials.spark_work_group}'. "
+                    )
+            except Exception as e:
+                LOGGER.warning(
+                    f"Failed to detect Spark version for workgroup '{credentials.spark_work_group}': {e}. "
+                )
+
         self.config = AthenaSparkSessionConfig(
             parsed_model.get("config", {}),
+            spark_version=spark_version,
             polling_interval=credentials.poll_interval,
             retry_attempts=credentials.num_retries,
         )

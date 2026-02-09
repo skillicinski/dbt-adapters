@@ -1,8 +1,10 @@
 import importlib.metadata
 from functools import lru_cache
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from botocore import config
+
+from dbt.adapters.athena.utils import is_spark_35
 
 from dbt.adapters.athena.constants import (
     DEFAULT_CALCULATION_TIMEOUT,
@@ -28,8 +30,11 @@ class AthenaSparkSessionConfig:
     A helper class to manage Athena Spark Session Configuration.
     """
 
-    def __init__(self, config: Dict[str, Any], **session_kwargs: Any) -> None:
+    def __init__(
+        self, config: Dict[str, Any], spark_version: Optional[str] = None, **session_kwargs: Any
+    ) -> None:
         self.config = config
+        self.spark_version = spark_version
         self.session_kwargs = session_kwargs
 
     def set_timeout(self) -> int:
@@ -129,12 +134,21 @@ class AthenaSparkSessionConfig:
             ),
         )
 
-        default_engine_config = {
-            "CoordinatorDpuSize": DEFAULT_SPARK_COORDINATOR_DPU_SIZE,
-            "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
-            "DefaultExecutorDpuSize": DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
-            "SparkProperties": default_spark_properties,
-        }
+        is_serverless = is_spark_35(self.spark_version)
+
+        default_engine_config: Dict[str, Any]
+
+        if is_serverless:
+            default_engine_config = {
+                "SparkProperties": default_spark_properties,
+            }
+        else:
+            default_engine_config = {
+                "CoordinatorDpuSize": DEFAULT_SPARK_COORDINATOR_DPU_SIZE,
+                "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
+                "DefaultExecutorDpuSize": DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
+                "SparkProperties": default_spark_properties,
+            }
         engine_config = self.config.get("engine_config", None)
 
         if engine_config:
@@ -149,26 +163,26 @@ class AthenaSparkSessionConfig:
         if not isinstance(engine_config, dict):
             raise TypeError("Engine configuration has to be of type dict")
 
-        expected_keys = {
-            "CoordinatorDpuSize",
-            "MaxConcurrentDpus",
-            "DefaultExecutorDpuSize",
-            "SparkProperties",
-            "AdditionalConfigs",
-        }
+        if is_serverless:
+            expected_keys = {
+                "SparkProperties",
+                "AdditionalConfigs",
+            }
+        else:
+            expected_keys = {
+                "CoordinatorDpuSize",
+                "MaxConcurrentDpus",
+                "DefaultExecutorDpuSize",
+                "SparkProperties",
+                "AdditionalConfigs",
+            }
 
-        if set(engine_config.keys()) - {
-            "CoordinatorDpuSize",
-            "MaxConcurrentDpus",
-            "DefaultExecutorDpuSize",
-            "SparkProperties",
-            "AdditionalConfigs",
-        }:
+        if set(engine_config.keys()) - expected_keys:
             raise KeyError(
                 f"The engine configuration keys provided do not match the expected athena engine keys: {expected_keys}"
             )
 
-        if engine_config["MaxConcurrentDpus"] == 1:
+        if not is_serverless and engine_config.get("MaxConcurrentDpus") == 1:
             raise KeyError("The lowest value supported for MaxConcurrentDpus is 2")
-        LOGGER.debug(f"Setting engine configuration: {engine_config}")
+        LOGGER.debug(f"Setting engine configuration for {self.spark_version}: {engine_config}")
         return engine_config

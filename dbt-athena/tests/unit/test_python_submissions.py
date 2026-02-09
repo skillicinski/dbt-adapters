@@ -6,6 +6,7 @@ import botocore.exceptions
 import pytest
 from dbt_common.exceptions import DbtRuntimeError
 
+from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.python_submissions import AthenaPythonJobHelper
 from dbt.adapters.athena.session import AthenaSparkSessionManager
 
@@ -416,3 +417,122 @@ class TestSessionStateErrorHandling:
             assert result == {"ResultS3Uri": "test_results_s3_uri"}
             # Verify we made two attempts (once failed with BUSY, then succeeded)
             assert call_count[0] == 2
+
+
+class TestSparkVersionDetection:
+    """Tests for Spark version detection in AthenaPythonJobHelper."""
+
+    @patch("dbt.adapters.athena.python_submissions.get_boto3_session_from_credentials")
+    def test_detects_spark_35_version(self, mock_get_boto3_session, athena_credentials):
+        """Test that Spark 3.5 version is detected from workgroup."""
+        mock_athena_client = Mock()
+        mock_athena_client.get_work_group.return_value = {
+            "WorkGroup": {
+                "Configuration": {
+                    "EngineVersion": {"EffectiveEngineVersion": "Apache Spark version 3.5"}
+                }
+            }
+        }
+
+        mock_session = Mock()
+        mock_session.client.return_value = mock_athena_client
+        mock_get_boto3_session.return_value = mock_session
+
+        parsed_model = {"config": {}}
+        helper = AthenaPythonJobHelper(parsed_model, athena_credentials)
+
+        # Verify the config has Spark 3.5 version
+        assert helper.config.spark_version == "Apache Spark version 3.5"
+
+        # Verify engine config excludes DPU parameters
+        engine_config = helper.engine_config
+        assert "SparkProperties" in engine_config
+        assert "CoordinatorDpuSize" not in engine_config
+        assert "MaxConcurrentDpus" not in engine_config
+        assert "DefaultExecutorDpuSize" not in engine_config
+
+    @patch("dbt.adapters.athena.python_submissions.get_boto3_session_from_credentials")
+    def test_detects_legacy_pyspark_version(self, mock_get_boto3_session, athena_credentials):
+        """Test that legacy PySpark 3 version is detected from workgroup."""
+        mock_athena_client = Mock()
+        mock_athena_client.get_work_group.return_value = {
+            "WorkGroup": {
+                "Configuration": {
+                    "EngineVersion": {"EffectiveEngineVersion": "PySpark engine version 3"}
+                }
+            }
+        }
+
+        mock_session = Mock()
+        mock_session.client.return_value = mock_athena_client
+        mock_get_boto3_session.return_value = mock_session
+
+        parsed_model = {"config": {}}
+        helper = AthenaPythonJobHelper(parsed_model, athena_credentials)
+
+        # Verify the config has PySpark 3 version
+        assert helper.config.spark_version == "PySpark engine version 3"
+
+        # Verify engine config includes DPU parameters
+        engine_config = helper.engine_config
+        assert "CoordinatorDpuSize" in engine_config
+        assert "MaxConcurrentDpus" in engine_config
+        assert "DefaultExecutorDpuSize" in engine_config
+        assert "SparkProperties" in engine_config
+
+    @patch("dbt.adapters.athena.python_submissions.get_boto3_session_from_credentials")
+    def test_handles_version_detection_failure(self, mock_get_boto3_session, athena_credentials):
+        """Test that version detection failure defaults to legacy configuration."""
+        mock_get_boto3_session.side_effect = Exception("API Error")
+
+        parsed_model = {"config": {}}
+        helper = AthenaPythonJobHelper(parsed_model, athena_credentials)
+
+        # Should default to None (which triggers legacy behavior)
+        assert helper.config.spark_version is None
+
+        # Verify engine config includes DPU parameters (legacy fallback)
+        engine_config = helper.engine_config
+        assert "CoordinatorDpuSize" in engine_config
+        assert "MaxConcurrentDpus" in engine_config
+        assert "DefaultExecutorDpuSize" in engine_config
+
+    @patch("dbt.adapters.athena.python_submissions.get_boto3_session_from_credentials")
+    def test_handles_missing_engine_version(self, mock_get_boto3_session, athena_credentials):
+        """Test handling when workgroup has no engine version configured."""
+        mock_athena_client = Mock()
+        mock_athena_client.get_work_group.return_value = {"WorkGroup": {"Configuration": {}}}
+
+        mock_session = Mock()
+        mock_session.client.return_value = mock_athena_client
+        mock_get_boto3_session.return_value = mock_session
+
+        parsed_model = {"config": {}}
+        helper = AthenaPythonJobHelper(parsed_model, athena_credentials)
+
+        # Should be None when version not found
+        assert helper.config.spark_version is None
+
+        # Verify engine config includes DPU parameters (legacy fallback)
+        engine_config = helper.engine_config
+        assert "CoordinatorDpuSize" in engine_config
+
+    def test_skips_detection_when_no_workgroup(self):
+        """Test that version detection is skipped when no spark workgroup is configured."""
+        credentials = AthenaCredentials(
+            database="test_db",
+            schema="test_schema",
+            s3_staging_dir="s3://test-bucket/",
+            region_name="us-east-1",
+            spark_work_group=None,  # No workgroup
+        )
+
+        parsed_model = {"config": {}}
+        helper = AthenaPythonJobHelper(parsed_model, credentials)
+
+        # Should be None when no workgroup
+        assert helper.config.spark_version is None
+
+        # Verify engine config includes DPU parameters (legacy fallback)
+        engine_config = helper.engine_config
+        assert "CoordinatorDpuSize" in engine_config

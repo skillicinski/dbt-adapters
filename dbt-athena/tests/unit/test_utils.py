@@ -4,6 +4,8 @@ from dbt.adapters.athena.utils import (
     clean_sql_comment,
     ellipsis_comment,
     get_chunks,
+    get_spark_engine_version,
+    is_spark_35,
     is_valid_table_parameter_key,
     stringify_table_parameter_value,
 )
@@ -70,3 +72,86 @@ def test_get_chunks_more_elements_than_chunk():
 )
 def test_ellipsis_comment(max_len, expected):
     assert expected == ellipsis_comment("abc def ghi", max_len=max_len)
+
+
+class TestGetSparkEngineVersion:
+    """Tests for get_spark_engine_version function."""
+
+    def test_effective_engine_version(self):
+        """Test extraction of EffectiveEngineVersion."""
+        work_group_config = {
+            "WorkGroup": {
+                "Configuration": {
+                    "EngineVersion": {
+                        "EffectiveEngineVersion": "Apache Spark version 3.5",
+                        "SelectedEngineVersion": "AUTO",
+                    }
+                }
+            }
+        }
+        assert get_spark_engine_version(work_group_config) == "Apache Spark version 3.5"
+
+    def test_selected_engine_version_fallback(self):
+        """Test fallback to SelectedEngineVersion when EffectiveEngineVersion is missing."""
+        work_group_config = {
+            "WorkGroup": {
+                "Configuration": {
+                    "EngineVersion": {"SelectedEngineVersion": "PySpark engine version 3"}
+                }
+            }
+        }
+        assert get_spark_engine_version(work_group_config) == "PySpark engine version 3"
+
+    def test_missing_engine_version(self):
+        """Test returns None when engine version is missing."""
+        work_group_config = {"WorkGroup": {"Configuration": {}}}
+        assert get_spark_engine_version(work_group_config) is None
+
+    def test_empty_config(self):
+        """Test returns None for empty configuration."""
+        work_group_config = {}
+        assert get_spark_engine_version(work_group_config) is None
+
+    def test_malformed_config(self):
+        """Test handles malformed configuration gracefully."""
+        work_group_config = {"WorkGroup": {"Configuration": {"EngineVersion": None}}}
+        assert get_spark_engine_version(work_group_config) is None
+
+    def test_nested_key_missing(self):
+        """Test handles missing nested keys gracefully."""
+        work_group_config = {"WorkGroup": None}
+        assert get_spark_engine_version(work_group_config) is None
+
+
+class TestIsSpark35:
+    """Tests for is_spark_35 function."""
+
+    @pytest.mark.parametrize(
+        ("version_string", "expected"),
+        (
+            pytest.param("Apache Spark version 3.5", True, id="spark_35_apache"),
+            pytest.param("Apache Spark version 3.5.0", True, id="spark_35_patch"),
+            pytest.param("Spark 3.5", True, id="spark_35_short"),
+            pytest.param("PySpark engine version 3", False, id="pyspark_3_legacy"),
+            pytest.param("PySpark engine version 3.0", False, id="pyspark_30_legacy"),
+            pytest.param("Apache Spark version 3.4", False, id="spark_34"),
+            pytest.param("Apache Spark version 3.6", False, id="spark_36"),
+            pytest.param("Apache Spark version 4.0", False, id="spark_40"),
+            pytest.param("Apache Spark version 2.5", False, id="spark_25"),
+            pytest.param(None, False, id="none_version"),
+            pytest.param("", False, id="empty_string"),
+            pytest.param("invalid version string", False, id="no_version_numbers"),
+            pytest.param("version 3", False, id="missing_minor_version"),
+        ),
+    )
+    def test_version_detection(self, version_string, expected):
+        """Test version detection for various version strings."""
+        assert is_spark_35(version_string) == expected
+
+    def test_none_defaults_to_legacy(self):
+        """Test that None version defaults to legacy (False) for backward compatibility."""
+        assert is_spark_35(None) is False
+
+    def test_unknown_version_defaults_to_legacy(self):
+        """Test that unknown versions default to legacy (False) for safety."""
+        assert is_spark_35("unknown version format") is False
